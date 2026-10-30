@@ -1,0 +1,85 @@
+# Azure DevOps: el mismo pipeline orquestado, con stages en lugar de jobs con needs
+
+# 1 · Cuándo corre
+trigger:
+  branches:
+    include: [main, develop]
+pr:
+  branches:
+    include: [main, develop]
+schedules:
+  - cron: '0 11 * * 1-5'            # lunes a viernes, 06:00 en Lima (11:00 UTC)
+    displayName: Regresión diaria
+    branches:
+      include: [develop]
+    always: true                    # corre aunque no haya cambios
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  # 2 · Puerta de calidad: si el smoke falla, la regresión no arranca
+  - stage: Smoke
+    displayName: Smoke
+    jobs:
+      - job: smoke
+        displayName: Ejecutar @smoke
+        steps:
+          - task: JavaToolInstaller@0
+            inputs:
+              versionSpec: '17'
+              jdkArchitectureOption: x64
+              jdkSourceOption: PreInstalled
+          - script: mvn -B test "-Dcucumber.filter.tags=@smoke and not @bug"
+            displayName: Ejecutar @smoke
+          - task: PublishTestResults@2
+            displayName: Publicar resultados
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: target/cucumber-junit.xml
+              testRunTitle: Smoke
+
+  # 3 · Regresión en paralelo: un job por grupo de etiquetas (grupos sin cruces)
+  - stage: Regresion
+    displayName: Regresión
+    dependsOn: Smoke                # = needs: smoke
+    jobs:
+      - job: regresion
+        displayName: Regresión
+        strategy:
+          matrix:                   # un job por entrada; si uno falla, los demás siguen
+            seguridad:
+              GRUPO: seguridad
+              ETIQUETAS: '@seguridad and not @bug'
+            contrato:
+              GRUPO: contrato
+              ETIQUETAS: '@contrato and not @seguridad and not @bug'
+            negativos:
+              GRUPO: negativos
+              ETIQUETAS: '@negativo and not @seguridad and not @contrato and not @bug'
+            funcional:
+              GRUPO: funcional
+              ETIQUETAS: 'not @seguridad and not @contrato and not @negativo and not @bug'
+        steps:
+          - task: JavaToolInstaller@0
+            inputs:
+              versionSpec: '17'
+              jdkArchitectureOption: x64
+              jdkSourceOption: PreInstalled
+          - script: mvn -B test "-Dcucumber.filter.tags=$ETIQUETAS"
+            displayName: Ejecutar el grupo
+          # 4 · Reporte: Azure junta los resultados de todos los jobs en la pestaña Tests
+          - task: PublishTestResults@2
+            displayName: Publicar resultados
+            condition: succeededOrFailed()   # = if: !cancelled()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: target/cucumber-junit.xml
+              testRunTitle: Regresión $(GRUPO)
+          - task: PublishPipelineArtifact@1
+            displayName: Guardar el reporte HTML
+            condition: succeededOrFailed()
+            inputs:
+              targetPath: target/cucumber-report.html
+              artifact: reporte-$(GRUPO)-intento$(System.JobAttempt)
