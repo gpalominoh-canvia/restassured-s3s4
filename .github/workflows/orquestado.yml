@@ -1,0 +1,124 @@
+name: CI orquestado
+
+# 1 · Cuándo corre (lo mismo que el ci.yml de la sesión anterior)
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    - cron: '0 11 * * 1-5'          # lunes a viernes, 06:00 en Lima (11:00 UTC)
+  workflow_dispatch:                # botón "Run workflow" en la pestaña Actions
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orquestado-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 2 · Puerta de calidad: si el smoke falla, no se gasta tiempo en la regresión
+  smoke:
+    name: Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Ejecutar @smoke
+        run: mvn -B test "-Dcucumber.filter.tags=@smoke and not @bug"
+  # 3 · Regresión en paralelo: un job por grupo de etiquetas (grupos sin cruces)
+  regresion:
+    name: Regresión · ${{ matrix.grupo }}
+    needs: smoke
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false              # si un grupo falla, los demás terminan igual
+      matrix:
+        include:
+          - grupo: seguridad
+            etiquetas: '@seguridad and not @bug'
+          - grupo: contrato
+            etiquetas: '@contrato and not @seguridad and not @bug'
+          - grupo: negativos
+            etiquetas: '@negativo and not @seguridad and not @contrato and not @bug'
+          - grupo: funcional
+            etiquetas: 'not @seguridad and not @contrato and not @negativo and not @bug'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Ejecutar ${{ matrix.grupo }}
+        env:
+          ETIQUETAS: ${{ matrix.etiquetas }}
+        run: mvn -B test "-Dcucumber.filter.tags=$ETIQUETAS"
+      - name: Guardar el reporte del grupo
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: reporte-${{ matrix.grupo }}
+          path: |
+            target/cucumber-report.html
+            target/cucumber-junit.xml
+          retention-days: 7
+    # 4 · Un solo resultado con todos los grupos (también si alguno falló)
+  reporte:
+    name: Reporte consolidado
+    needs: regresion
+    if: ${{ !cancelled() && needs.regresion.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write                 # el check "Resultados de Cucumber"
+      pull-requests: write          # el comentario en el PR
+    steps:
+      - name: Descargar los reportes de cada grupo
+        uses: actions/download-artifact@v8
+        with:
+          pattern: reporte-*
+          path: reportes
+      - name: Resumen de pruebas
+        uses: mikepenz/action-junit-report@v6
+        with:
+          report_paths: 'reportes/**/cucumber-junit.xml'
+          check_name: Resultados de Cucumber
+          include_passed: true
+          detailed_summary: true
+          comment: ${{ github.event_name == 'pull_request' }}
+      - name: Armar el sitio con un reporte por grupo
+        run: |
+          mkdir -p sitio
+          echo '<h1>Regresión por grupos</h1><ul>' > sitio/index.html
+          for dir in reportes/reporte-*/; do
+            grupo=$(basename "$dir"); grupo=${grupo#reporte-}
+            cp "$dir/cucumber-report.html" "sitio/$grupo.html"
+            echo "<li><a href=\"$grupo.html\">$grupo</a></li>" >> sitio/index.html
+          done
+          echo '</ul>' >> sitio/index.html
+      - name: Subir el sitio para Pages
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/develop'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: sitio
+    # 5 · Publicar en GitHub Pages (solo desde develop)
+  publicar:
+    name: Publicar en GitHub Pages
+    needs: reporte
+    if: ${{ !cancelled() && needs.reporte.result == 'success' && github.event_name != 'pull_request' && github.ref == 'refs/heads/develop' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.despliegue.outputs.page_url }}
+    steps:
+      - id: despliegue
+        uses: actions/deploy-pages@v5
